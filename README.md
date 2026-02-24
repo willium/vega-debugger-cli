@@ -21,22 +21,16 @@ Each issue includes `source` (`schema`, `compile`, `runtime`) and `message`.
 bun install
 ```
 
-## Build
-
-```bash
-bun run build
-```
-
 ## Run
 
 ```bash
 bun run src/cli.ts --help
 ```
 
-After build:
+With `bunx` (no build step):
 
 ```bash
-node dist/cli.js --help
+bunx --bun vega-debugger --help
 ```
 
 ## Examples
