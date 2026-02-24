@@ -5,7 +5,7 @@
   "description": "CLI to validate and debug Vega / Vega-Lite specs.",
   "type": "module",
   "bin": {
-    "vega-debugger": "./src/cli.ts"
+    "vega-debugger": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
