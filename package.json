@@ -1,0 +1,29 @@
+{
+  "name": "vega-debugger-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CLI to validate and debug Vega / Vega-Lite specs.",
+  "type": "module",
+  "bin": {
+    "vega-debugger": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "bun run src/cli.ts",
+    "start:node": "node dist/cli.js"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "vega": "^6.2.0",
+    "vega-lite": "^6.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.4.0",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

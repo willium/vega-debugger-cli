@@ -1,0 +1,10 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+  "description": "Intentionally broken schema example.",
+  "data": { "values": [ { "x": 1, "y": 2 } ] },
+  "mark": "bar",
+  "encoding": {
+    "x": { "field": "x", "type": "not-a-valid-type" },
+    "y": { "field": "y", "type": "quantitative" }
+  }
+}

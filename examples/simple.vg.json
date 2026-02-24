@@ -1,0 +1,47 @@
+{
+  "$schema": "https://vega.github.io/schema/vega/v6.json",
+  "width": 200,
+  "height": 200,
+  "padding": 5,
+  "signals": [
+    { "name": "barFill", "value": "steelblue" }
+  ],
+  "data": [
+    {
+      "name": "source_0",
+      "values": [
+        { "x": 10, "y": 30 },
+        { "x": 50, "y": 80 }
+      ]
+    }
+  ],
+  "scales": [
+    {
+      "name": "x",
+      "type": "linear",
+      "domain": [0, 100],
+      "range": "width"
+    },
+    {
+      "name": "y",
+      "type": "linear",
+      "domain": [0, 100],
+      "range": "height"
+    }
+  ],
+  "marks": [
+    {
+      "type": "rect",
+      "from": { "data": "source_0" },
+      "encode": {
+        "enter": {
+          "x": { "scale": "x", "field": "x" },
+          "y": { "scale": "y", "field": "y" },
+          "x2": { "scale": "x", "value": 100 },
+          "y2": { "scale": "y", "value": 0 },
+          "fill": { "signal": "barFill" }
+        }
+      }
+    }
+  ]
+}

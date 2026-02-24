@@ -1,0 +1,25 @@
+{
+  "$schema": "https://vega.github.io/schema/vega/v6.json",
+  "width": 200,
+  "height": 100,
+  "data": [
+    {
+      "name": "table",
+      "values": [
+        { "x": 10, "y": 20 }
+      ]
+    }
+  ],
+  "marks": [
+    {
+      "type": "symbol",
+      "from": { "data": "table" },
+      "encode": {
+        "enter": {
+          "x": { "scale": "missing_scale", "field": "x" },
+          "y": { "scale": "missing_scale", "field": "y" }
+        }
+      }
+    }
+  ]
+}
