@@ -118,6 +118,7 @@ Options:
       --max-warnings <n>     Max warnings in output report (default: 12).
       --no-dedupe            Disable deduplication of repeated issues.
       --include-stack        Keep full stack traces in error messages.
+      --include-schema-errors Include raw schemaValidation.errors in output.
       --only-issues          Emit minimal JSON focused on actionable issues.
       --output <mode>        Output mode: json | text (default: json).
       --print-compiled       Include compiled Vega spec in output report.
@@ -147,6 +148,7 @@ async function main(argv: string[]): Promise<number> {
         'max-warnings': { type: 'string', default: '12' },
         'no-dedupe': { type: 'boolean', default: false },
         'include-stack': { type: 'boolean', default: false },
+        'include-schema-errors': { type: 'boolean', default: false },
         'only-issues': { type: 'boolean', default: false },
         output: { type: 'string', default: 'json' },
         'print-compiled': { type: 'boolean', default: false },
@@ -264,7 +266,13 @@ async function main(argv: string[]): Promise<number> {
 
       report.issues = collectIssues(report);
       tuneReport(report, tuning);
-      await writeReport(report, parsed.values.out, normalizedOutputMode, parsed.values['only-issues']);
+      await writeReport(
+        report,
+        parsed.values.out,
+        normalizedOutputMode,
+        parsed.values['only-issues'],
+        parsed.values['include-schema-errors']
+      );
       return 2;
     }
   } else {
@@ -296,7 +304,13 @@ async function main(argv: string[]): Promise<number> {
 
   report.issues = collectIssues(report);
   tuneReport(report, tuning);
-  await writeReport(report, parsed.values.out, normalizedOutputMode, parsed.values['only-issues']);
+  await writeReport(
+    report,
+    parsed.values.out,
+    normalizedOutputMode,
+    parsed.values['only-issues'],
+    parsed.values['include-schema-errors']
+  );
 
   return report.runtime.success ? 0 : 2;
 }
@@ -735,7 +749,7 @@ function dedupeIssues(issues: Issue[]): Issue[] {
   return out;
 }
 
-function minimalIssuePayload(report: DebugReport) {
+function minimalIssuePayload(report: DebugReport, includeSchemaErrors: boolean) {
   return {
     input: report.input,
     issues: report.issues,
@@ -743,7 +757,8 @@ function minimalIssuePayload(report: DebugReport) {
       attempted: report.schemaValidation.attempted,
       ok: report.schemaValidation.ok,
       schemaUrl: report.schemaValidation.schemaUrl,
-      warning: report.schemaValidation.warning
+      warning: report.schemaValidation.warning,
+      errors: includeSchemaErrors ? report.schemaValidation.errors : undefined
     },
     compile: {
       applied: report.compile.applied
@@ -788,9 +803,19 @@ async function writeReport(
   report: DebugReport,
   outPath: string | undefined,
   outputMode: OutputMode,
-  onlyIssues: boolean
+  onlyIssues: boolean,
+  includeSchemaErrors: boolean
 ): Promise<void> {
-  const payload = onlyIssues ? minimalIssuePayload(report) : report;
+  const payload = onlyIssues ? minimalIssuePayload(report, includeSchemaErrors) : report;
+  if (!includeSchemaErrors && payload && typeof payload === 'object' && 'schemaValidation' in payload) {
+    const withSchema = payload as { schemaValidation?: SchemaValidationResult };
+    if (withSchema.schemaValidation) {
+      withSchema.schemaValidation = {
+        ...withSchema.schemaValidation,
+        errors: undefined
+      };
+    }
+  }
   const text = outputMode === 'json'
     ? `${JSON.stringify(payload, null, 2)}\n`
     : formatTextReport(report);
