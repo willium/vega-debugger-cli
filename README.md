@@ -76,6 +76,12 @@ Write report to file:
 bun run src/cli.ts --spec ./examples/simple.vl.json --out ./debug-report.json
 ```
 
+Agent/tight-token mode:
+
+```bash
+node dist/cli.js --spec ./examples/broken-schema.vl.json --only-issues --max-errors 6 --max-warnings 3
+```
+
 ## Output shape
 
 ```json

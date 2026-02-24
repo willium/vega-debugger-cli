@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 import { parseArgs } from 'node:util';
 import { readFile, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
 import * as vega from 'vega';
@@ -10,6 +10,7 @@ import { compile as compileVegaLite } from 'vega-lite';
 
 type SpecFormat = 'vega' | 'vega-lite';
 type LogLevel = 'error' | 'warn' | 'info' | 'debug';
+type OutputMode = 'json' | 'text';
 
 type JsonObject = Record<string, unknown>;
 
@@ -45,15 +46,25 @@ type RuntimeSignalSummary = {
   value: unknown;
 };
 
+type IssuesBlock = {
+  errors: Issue[];
+  warnings: Issue[];
+  summary?: {
+    totalErrors: number;
+    totalWarnings: number;
+    shownErrors: number;
+    shownWarnings: number;
+    deduplicated: boolean;
+    truncated: boolean;
+  };
+};
+
 type DebugReport = {
   input: {
     specPath: string;
     format: SpecFormat;
   };
-  issues: {
-    errors: Issue[];
-    warnings: Issue[];
-  };
+  issues: IssuesBlock;
   schemaValidation: SchemaValidationResult;
   compile: {
     applied: boolean;
@@ -79,7 +90,13 @@ type DebugReport = {
   compiledSpec?: unknown;
 };
 
-type OutputMode = 'json' | 'text';
+type TuningOptions = {
+  includeStack: boolean;
+  dedupe: boolean;
+  maxErrors: number;
+  maxWarnings: number;
+};
+
 const require = createRequire(import.meta.url);
 
 const HELP_TEXT = `Usage:
@@ -97,9 +114,14 @@ Options:
       --runtime              Include runtime internals summary from view._runtime.
       --log-level <level>    Runtime log level: error | warn | info | debug (default: warn).
       --sample-size <n>      Rows to include in each data sample (default: 5).
+      --max-errors <n>       Max errors in output report (default: 12).
+      --max-warnings <n>     Max warnings in output report (default: 12).
+      --no-dedupe            Disable deduplication of repeated issues.
+      --include-stack        Keep full stack traces in error messages.
+      --only-issues          Emit minimal JSON focused on actionable issues.
       --output <mode>        Output mode: json | text (default: json).
       --print-compiled       Include compiled Vega spec in output report.
-  -o, --out <path>           Write output JSON report to a file.
+  -o, --out <path>           Write output report to a file.
   -h, --help                 Show this message.
 `;
 
@@ -121,6 +143,11 @@ async function main(argv: string[]): Promise<number> {
         runtime: { type: 'boolean', default: false },
         'log-level': { type: 'string', default: 'warn' },
         'sample-size': { type: 'string', default: '5' },
+        'max-errors': { type: 'string', default: '12' },
+        'max-warnings': { type: 'string', default: '12' },
+        'no-dedupe': { type: 'boolean', default: false },
+        'include-stack': { type: 'boolean', default: false },
+        'only-issues': { type: 'boolean', default: false },
         output: { type: 'string', default: 'json' },
         'print-compiled': { type: 'boolean', default: false },
         out: { type: 'string', short: 'o' },
@@ -130,7 +157,7 @@ async function main(argv: string[]): Promise<number> {
       allowPositionals: false
     });
   } catch (err) {
-    process.stderr.write(`${toErrorMessage(err)}\n\n${HELP_TEXT}`);
+    process.stderr.write(`${toErrorMessage(err, false)}\n\n${HELP_TEXT}`);
     return 1;
   }
 
@@ -157,9 +184,10 @@ async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
-  const sampleSize = Number(parsed.values['sample-size']);
-  if (!Number.isInteger(sampleSize) || sampleSize < 0) {
-    process.stderr.write('Invalid --sample-size. Use a non-negative integer.\n');
+  const sampleSize = parseNonNegativeInt(parsed.values['sample-size'], '--sample-size');
+  const maxErrors = parseNonNegativeInt(parsed.values['max-errors'], '--max-errors');
+  const maxWarnings = parseNonNegativeInt(parsed.values['max-warnings'], '--max-warnings');
+  if (sampleSize === undefined || maxErrors === undefined || maxWarnings === undefined) {
     return 1;
   }
 
@@ -170,6 +198,13 @@ async function main(argv: string[]): Promise<number> {
   }
   const normalizedOutputMode: OutputMode = outputMode;
 
+  const tuning: TuningOptions = {
+    includeStack: parsed.values['include-stack'],
+    dedupe: !parsed.values['no-dedupe'],
+    maxErrors,
+    maxWarnings
+  };
+
   const specPath = resolve(specPathRaw);
 
   let inputSpec: unknown;
@@ -177,7 +212,7 @@ async function main(argv: string[]): Promise<number> {
     const text = await readFile(specPath, 'utf8');
     inputSpec = JSON.parse(text);
   } catch (err) {
-    process.stderr.write(`Failed to read spec: ${toErrorMessage(err)}\n`);
+    process.stderr.write(`Failed to read spec: ${toErrorMessage(err, false)}\n`);
     return 1;
   }
 
@@ -191,7 +226,6 @@ async function main(argv: string[]): Promise<number> {
 
   const schemaValidation = await validateSchema({
     inputSpec,
-    format: detectedFormat,
     schemaOverrideUrl: parsed.values['schema-url'],
     skipValidation: parsed.values['no-validate-schema']
   });
@@ -215,14 +249,11 @@ async function main(argv: string[]): Promise<number> {
         schemaValidation,
         compile: {
           applied: true,
-          logs: [
-            ...compileLogs,
-            { level: 'error', message: toErrorMessage(err) }
-          ]
+          logs: [...compileLogs, { level: 'error', message: toErrorMessage(err, true) }]
         },
         runtime: {
           success: false,
-          error: `Vega-Lite compile failed: ${toErrorMessage(err)}`,
+          error: `Vega-Lite compile failed: ${toErrorMessage(err, true)}`,
           logs: [],
           availableSignals: [],
           availableData: [],
@@ -230,9 +261,10 @@ async function main(argv: string[]): Promise<number> {
           inspectedData: []
         }
       };
-      report.issues = collectIssues(report);
 
-      await writeReport(report, parsed.values.out, normalizedOutputMode);
+      report.issues = collectIssues(report);
+      tuneReport(report, tuning);
+      await writeReport(report, parsed.values.out, normalizedOutputMode, parsed.values['only-issues']);
       return 2;
     }
   } else {
@@ -251,10 +283,7 @@ async function main(argv: string[]): Promise<number> {
   });
 
   const report: DebugReport = {
-    input: {
-      specPath,
-      format: detectedFormat
-    },
+    input: { specPath, format: detectedFormat },
     issues: { errors: [], warnings: [] },
     schemaValidation,
     compile: {
@@ -264,11 +293,21 @@ async function main(argv: string[]): Promise<number> {
     runtime,
     compiledSpec: parsed.values['print-compiled'] ? vegaSpec : undefined
   };
+
   report.issues = collectIssues(report);
+  tuneReport(report, tuning);
+  await writeReport(report, parsed.values.out, normalizedOutputMode, parsed.values['only-issues']);
 
-  await writeReport(report, parsed.values.out, normalizedOutputMode);
+  return report.runtime.success ? 0 : 2;
+}
 
-  return runtime.success ? 0 : 2;
+function parseNonNegativeInt(raw: string, flag: string): number | undefined {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    process.stderr.write(`Invalid ${flag}. Use a non-negative integer.\n`);
+    return undefined;
+  }
+  return value;
 }
 
 function detectFormat(spec: JsonObject, formatArg: 'auto' | SpecFormat): SpecFormat {
@@ -277,16 +316,11 @@ function detectFormat(spec: JsonObject, formatArg: 'auto' | SpecFormat): SpecFor
   }
 
   const schema = typeof spec.$schema === 'string' ? spec.$schema.toLowerCase() : '';
-  if (schema.includes('/vega-lite/')) {
-    return 'vega-lite';
-  }
-
-  return 'vega';
+  return schema.includes('/vega-lite/') ? 'vega-lite' : 'vega';
 }
 
 async function validateSchema(args: {
   inputSpec: JsonObject;
-  format: SpecFormat;
   schemaOverrideUrl?: string;
   skipValidation: boolean;
 }): Promise<SchemaValidationResult> {
@@ -317,7 +351,7 @@ async function validateSchema(args: {
       schemaDoc = await response.json();
     }
   } catch (err) {
-    remoteError = toErrorMessage(err);
+    remoteError = toErrorMessage(err, true);
   }
 
   let localWarning: string | undefined;
@@ -328,7 +362,7 @@ async function validateSchema(args: {
         localWarning = `Remote schema fetch failed; validated with local ${parsed.library} schema from installed package.`;
       }
     } catch (localErr) {
-      const errors = [remoteError, toErrorMessage(localErr)].filter(Boolean) as string[];
+      const errors = [remoteError, toErrorMessage(localErr, true)].filter(Boolean) as string[];
       return {
         attempted: true,
         ok: false,
@@ -397,9 +431,8 @@ function parseSchemaUrl(url: string): { library: SpecFormat; version: string } |
     return undefined;
   }
 
-  const library = match[1].toLowerCase() === 'vega-lite' ? 'vega-lite' : 'vega';
   return {
-    library,
+    library: match[1].toLowerCase() === 'vega-lite' ? 'vega-lite' : 'vega',
     version: match[2]
   };
 }
@@ -415,13 +448,17 @@ async function runRuntimeDebug(args: {
   sampleSize: number;
 }): Promise<DebugReport['runtime']> {
   const logs: LogEntry[] = [];
+  let runtimeLoggedError: string | undefined;
 
   let view: vega.View;
   try {
     const runtime = vega.parse(args.vegaSpec);
-    view = new vega.View(runtime, { renderer: 'none' });
-
-    view.logLevel(toVegaLogLevel(args.logLevel));
+    view = new vega.View(runtime, {
+      renderer: 'none',
+      logger: createVegaLogger(args.logLevel, logs, (message) => {
+        runtimeLoggedError = message;
+      })
+    });
 
     for (const assignment of args.setSignals) {
       const [name, rawValue] = parseSignalAssignment(assignment);
@@ -432,7 +469,19 @@ async function runRuntimeDebug(args: {
   } catch (err) {
     return {
       success: false,
-      error: toErrorMessage(err),
+      error: toErrorMessage(err, true),
+      logs,
+      availableSignals: [],
+      availableData: [],
+      inspectedSignals: [],
+      inspectedData: []
+    };
+  }
+
+  if (runtimeLoggedError) {
+    return {
+      success: false,
+      error: runtimeLoggedError,
       logs,
       availableSignals: [],
       availableData: [],
@@ -443,17 +492,13 @@ async function runRuntimeDebug(args: {
 
   const signalNames = extractSignalNames(args.vegaSpec);
   const dataNames = extractDataNames(args.vegaSpec);
-
   const inspectSignals = args.signalNames.length > 0 ? args.signalNames : signalNames;
   const inspectData = args.dataNames.length > 0 ? args.dataNames : dataNames;
 
   const inspectedSignals: RuntimeSignalSummary[] = [];
   for (const name of inspectSignals) {
     try {
-      inspectedSignals.push({
-        name,
-        value: view.signal(name)
-      });
+      inspectedSignals.push({ name, value: view.signal(name) });
     } catch {
       inspectedSignals.push({ name, value: '[not available]' });
     }
@@ -469,16 +514,9 @@ async function runRuntimeDebug(args: {
         sample: Array.isArray(values) ? values.slice(0, args.sampleSize) : []
       });
     } catch {
-      inspectedData.push({
-        name,
-        size: 0,
-        sample: []
-      });
+      inspectedData.push({ name, size: 0, sample: [] });
     }
   }
-
-  const state = args.includeState ? view.getState() : undefined;
-  const runtimeSummary = args.includeRuntime ? summarizeRuntime(view) : undefined;
 
   return {
     success: true,
@@ -487,8 +525,8 @@ async function runRuntimeDebug(args: {
     availableData: dataNames,
     inspectedSignals,
     inspectedData,
-    state,
-    runtimeSummary
+    state: args.includeState ? view.getState() : undefined,
+    runtimeSummary: args.includeRuntime ? summarizeRuntime(view) : undefined
   };
 }
 
@@ -504,18 +542,12 @@ function summarizeRuntime(view: vega.View): DebugReport['runtime']['runtimeSumma
     };
   }
 
-  const signals = isObject(runtime.signals) ? Object.keys(runtime.signals).length : 0;
-  const data = isObject(runtime.data) ? Object.keys(runtime.data).length : 0;
-  const scales = isObject(runtime.scales) ? Object.keys(runtime.scales).length : 0;
-  const nodes = isObject(runtime.nodes) ? Object.keys(runtime.nodes).length : 0;
-  const subcontext = Array.isArray(runtime.subcontext) ? runtime.subcontext.length : 0;
-
   return {
-    signalOperators: signals,
-    dataNodes: data,
-    scaleOperators: scales,
-    subcontextCount: subcontext,
-    nodeCount: nodes
+    signalOperators: isObject(runtime.signals) ? Object.keys(runtime.signals).length : 0,
+    dataNodes: isObject(runtime.data) ? Object.keys(runtime.data).length : 0,
+    scaleOperators: isObject(runtime.scales) ? Object.keys(runtime.scales).length : 0,
+    subcontextCount: Array.isArray(runtime.subcontext) ? runtime.subcontext.length : 0,
+    nodeCount: isObject(runtime.nodes) ? Object.keys(runtime.nodes).length : 0
   };
 }
 
@@ -523,7 +555,6 @@ function extractSignalNames(spec: JsonObject): string[] {
   if (!Array.isArray(spec.signals)) {
     return [];
   }
-
   return spec.signals
     .map((signal) => (isObject(signal) && typeof signal.name === 'string' ? signal.name : undefined))
     .filter((name): name is string => typeof name === 'string');
@@ -533,7 +564,6 @@ function extractDataNames(spec: JsonObject): string[] {
   if (!Array.isArray(spec.data)) {
     return [];
   }
-
   return spec.data
     .map((dataset) => (isObject(dataset) && typeof dataset.name === 'string' ? dataset.name : undefined))
     .filter((name): name is string => typeof name === 'string');
@@ -577,24 +607,38 @@ function toVegaLogLevel(level: LogLevel): number {
   }
 }
 
-function collectIssues(report: DebugReport): DebugReport['issues'] {
+function createVegaLogger(
+  level: LogLevel,
+  logs: LogEntry[],
+  onError: (message: string) => void
+) {
+  return vega.logger(
+    toVegaLogLevel(level),
+    undefined,
+    (method: 'error' | 'warn' | 'log', _levelLabel: 'ERROR' | 'WARN' | 'INFO' | 'DEBUG', input: readonly unknown[]) => {
+      const text = Array.from(input).map(stringifyUnknown).join(' ');
+      if (method === 'error') {
+        logs.push({ level: 'error', message: text });
+        onError(text);
+      } else if (method === 'warn') {
+        logs.push({ level: 'warn', message: text });
+      } else {
+        logs.push({ level: 'info', message: text });
+      }
+    }
+  );
+}
+
+function collectIssues(report: DebugReport): IssuesBlock {
   const errors: Issue[] = [];
   const warnings: Issue[] = [];
 
   if (report.schemaValidation.warning) {
-    warnings.push({
-      source: 'schema',
-      level: 'warning',
-      message: report.schemaValidation.warning
-    });
+    warnings.push({ source: 'schema', level: 'warning', message: report.schemaValidation.warning });
   }
 
   for (const schemaError of report.schemaValidation.errors || []) {
-    errors.push({
-      source: 'schema',
-      level: 'error',
-      message: schemaError
-    });
+    errors.push({ source: 'schema', level: 'error', message: schemaError });
   }
 
   for (const log of report.compile.logs) {
@@ -614,14 +658,101 @@ function collectIssues(report: DebugReport): DebugReport['issues'] {
   }
 
   if (report.runtime.error) {
-    errors.push({
-      source: 'runtime',
-      level: 'error',
-      message: report.runtime.error
-    });
+    errors.push({ source: 'runtime', level: 'error', message: report.runtime.error });
   }
 
   return { errors, warnings };
+}
+
+function tuneReport(report: DebugReport, options: TuningOptions): void {
+  const sanitize = (text: string) => sanitizeMessage(text, options.includeStack);
+
+  if (report.schemaValidation.warning) {
+    report.schemaValidation.warning = sanitize(report.schemaValidation.warning);
+  }
+
+  report.schemaValidation.errors = (report.schemaValidation.errors || []).map(sanitize);
+  if (options.dedupe) {
+    report.schemaValidation.errors = dedupeStrings(report.schemaValidation.errors);
+  }
+  report.schemaValidation.errors = report.schemaValidation.errors.slice(0, options.maxErrors);
+
+  report.compile.logs = report.compile.logs.map((log) => ({ ...log, message: sanitize(log.message) }));
+  report.runtime.logs = report.runtime.logs.map((log) => ({ ...log, message: sanitize(log.message) }));
+  if (report.runtime.error) {
+    report.runtime.error = sanitize(report.runtime.error);
+  }
+
+  report.issues.errors = report.issues.errors.map((issue) => ({ ...issue, message: sanitize(issue.message) }));
+  report.issues.warnings = report.issues.warnings.map((issue) => ({ ...issue, message: sanitize(issue.message) }));
+
+  if (options.dedupe) {
+    report.issues.errors = dedupeIssues(report.issues.errors);
+    report.issues.warnings = dedupeIssues(report.issues.warnings);
+  }
+
+  const totalErrors = report.issues.errors.length;
+  const totalWarnings = report.issues.warnings.length;
+
+  report.issues.errors = report.issues.errors.slice(0, options.maxErrors);
+  report.issues.warnings = report.issues.warnings.slice(0, options.maxWarnings);
+  report.issues.summary = {
+    totalErrors,
+    totalWarnings,
+    shownErrors: report.issues.errors.length,
+    shownWarnings: report.issues.warnings.length,
+    deduplicated: options.dedupe,
+    truncated: totalErrors > report.issues.errors.length || totalWarnings > report.issues.warnings.length
+  };
+}
+
+function sanitizeMessage(message: string, includeStack: boolean): string {
+  const trimmed = message.trim();
+  if (includeStack) {
+    return trimmed;
+  }
+  const firstLine = trimmed.split('\n')[0];
+  return firstLine || trimmed;
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
+}
+
+function dedupeIssues(issues: Issue[]): Issue[] {
+  const seen = new Set<string>();
+  const out: Issue[] = [];
+
+  for (const issue of issues) {
+    const key = `${issue.source}|${issue.level}|${issue.message}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(issue);
+  }
+
+  return out;
+}
+
+function minimalIssuePayload(report: DebugReport) {
+  return {
+    input: report.input,
+    issues: report.issues,
+    schemaValidation: {
+      attempted: report.schemaValidation.attempted,
+      ok: report.schemaValidation.ok,
+      schemaUrl: report.schemaValidation.schemaUrl,
+      warning: report.schemaValidation.warning
+    },
+    compile: {
+      applied: report.compile.applied
+    },
+    runtime: {
+      success: report.runtime.success,
+      error: report.runtime.error
+    }
+  };
 }
 
 function formatTextReport(report: DebugReport): string {
@@ -629,15 +760,23 @@ function formatTextReport(report: DebugReport): string {
   lines.push(`Spec: ${report.input.specPath}`);
   lines.push(`Format: ${report.input.format}`);
   lines.push('');
-  lines.push(`Errors (${report.issues.errors.length})`);
+
+  const summary = report.issues.summary;
+  if (summary) {
+    lines.push(
+      `Errors (${summary.shownErrors}/${summary.totalErrors}), Warnings (${summary.shownWarnings}/${summary.totalWarnings})`
+    );
+  } else {
+    lines.push(`Errors (${report.issues.errors.length}), Warnings (${report.issues.warnings.length})`);
+  }
+
   for (const issue of report.issues.errors) {
     lines.push(`- [${issue.source}] ${issue.message}`);
   }
-  lines.push('');
-  lines.push(`Warnings (${report.issues.warnings.length})`);
   for (const issue of report.issues.warnings) {
     lines.push(`- [${issue.source}] ${issue.message}`);
   }
+
   lines.push('');
   lines.push(`Runtime success: ${report.runtime.success ? 'yes' : 'no'}`);
   lines.push(`Signals available: ${report.runtime.availableSignals.length}`);
@@ -645,10 +784,17 @@ function formatTextReport(report: DebugReport): string {
   return `${lines.join('\n')}\n`;
 }
 
-async function writeReport(report: DebugReport, outPath: string | undefined, outputMode: OutputMode): Promise<void> {
+async function writeReport(
+  report: DebugReport,
+  outPath: string | undefined,
+  outputMode: OutputMode,
+  onlyIssues: boolean
+): Promise<void> {
+  const payload = onlyIssues ? minimalIssuePayload(report) : report;
   const text = outputMode === 'json'
-    ? `${JSON.stringify(report, null, 2)}\n`
+    ? `${JSON.stringify(payload, null, 2)}\n`
     : formatTextReport(report);
+
   if (outPath) {
     await writeFile(resolve(outPath), text, 'utf8');
     return;
@@ -659,26 +805,35 @@ async function writeReport(report: DebugReport, outPath: string | undefined, out
 
 function stringifyLog(parts: unknown[]): string {
   return parts
-    .map((part) => {
-      if (typeof part === 'string') {
-        return part;
-      }
-      try {
-        return JSON.stringify(part);
-      } catch {
-        return String(part);
-      }
-    })
+    .map(stringifyUnknown)
     .join(' ');
+}
+
+function stringifyUnknown(part: unknown): string {
+  if (part instanceof Error) {
+    return part.stack || part.message;
+  }
+  if (typeof part === 'string') {
+    return part;
+  }
+  if (isObject(part) && typeof part.message === 'string') {
+    return String(part.message);
+  }
+  try {
+    return JSON.stringify(part);
+  } catch {
+    return String(part);
+  }
 }
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null;
 }
 
-function toErrorMessage(err: unknown): string {
+function toErrorMessage(err: unknown, includeStack: boolean): string {
   if (err instanceof Error) {
-    return err.stack || err.message;
+    const message = includeStack ? (err.stack || err.message) : err.message;
+    return message || String(err);
   }
   return String(err);
 }
